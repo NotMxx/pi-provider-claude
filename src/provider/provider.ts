@@ -234,7 +234,7 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
         model: model.id, systemPrompt, claudeCodeContext: current.claudeCodeContext, effort, maxTokens, tools, ...(history ? { history } : {}), input,
       }, model);
 
-      proc = await continueWarm(configKey, want, system, conversation, fps, payload);
+      proc = await continueWarm(configKey, want, system, conversation, fps, payload, opts?.sessionId, tools.length === 0);
       if (!proc) {
         const claudePath = await options.binary();
         if (closed) throw new Error(`${PROVIDER_ID} provider is closed`);
@@ -258,11 +258,11 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
         void spawned.exited.then(() => pool.delete(spawned));
         // This session's conversation went somewhere its idle processes cannot follow (a compaction, a branch): they
         // would never be continued. Only those with the same settings and leading prompt: a reviewer or compaction call
-        // of the same session has its own system prompt and must not end the conversation's warm process.
+        // of the same session (no tools) has its own system prompt, or reuses it, and must not end a warm process with tools.
         if (opts.sessionId !== undefined) {
           for (const p of pool) {
             if (p.session === opts.sessionId && p.configKey === configKey && p.system[0] === spawned.system[0]
-              && !p.busy && !p.awaiting.length) { pool.delete(p); void p.stop(); }
+              && (tools.length > 0 || p.oneShot) && !p.busy && !p.awaiting.length) { pool.delete(p); void p.stop(); }
           }
         }
         if (pool.size >= maxProcesses) {
@@ -303,10 +303,16 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
    * must be the first of the current ones; the others go in with the next user input as a reminder (after tool results,
    * which reach Claude Code as answers to its calls, they wait for that input).
    */
-  async function continueWarm(configKey: string, want: Want, system: SystemState, conversation: Message[], fps: string[], payload: (input: unknown) => unknown) {
+  async function continueWarm(configKey: string, want: Want, system: SystemState, conversation: Message[], fps: string[], payload: (input: unknown) => unknown,
+    session: string | undefined, oneShot: boolean) {
     for (const p of pool) {
       if (!p.alive) { pool.delete(p); continue; }
       if (p.busy || p.seen.length >= fps.length) continue;
+      // Another session's process, even with the same opening, is never continued or closed from here.
+      if (session !== undefined && p.session !== undefined && p.session !== session) continue;
+      // A one-shot call (no tools: a reviewer, a compaction) resends the history under a prompt of its own: it never
+      // goes into, or closes, a conversation that has tools; the conversation goes on in this process after it.
+      if (oneShot && !p.oneShot) continue;
       if (!p.seen.every((f, i) => f === fps[i])) continue;
       const rest = conversation.slice(p.seen.length);
       const fits = p.configKey === configKey && p.system.length <= system.keys.length && p.system.every((k, i) => k === system.keys[i]);

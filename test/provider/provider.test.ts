@@ -549,6 +549,34 @@ test('a new process of another session leaves this session\'s warm process alone
   } finally { await env.service.close(); }
 });
 
+test("a one-shot call that resends this session's history leaves the warm process to continue, whatever its prompt", async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }, { text: 'd' }] }], { idleMs: 60_000 });
+  const spawns = () => env.log().filter((l) => l.kind === 'spawn').length;
+  try {
+    const messages: Message[] = [user('one')];
+    messages.push((await step(env, messages, { sessionId: 'x' })).msg);
+    await step(env, [...messages, user('Summarize the conversation.')], { sessionId: 'x', systemPrompt: 'You summarize.', tools: [] });
+    await step(env, [...messages, user('Name this conversation.')], { sessionId: 'x', tools: [] });
+    assert.equal(spawns(), 3);
+    messages.push(user('two'));
+    assert.deepEqual((await step(env, messages, { sessionId: 'x' })).msg.content, [{ type: 'text', text: 'd' }]);
+    assert.equal(spawns(), 3, "the session's process continued");
+  } finally { await env.service.close(); }
+});
+
+test("another session with the same opening never continues this session's process", async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }] }], { idleMs: 60_000 });
+  try {
+    const opening: Message[] = [user('one')];
+    const first = await step(env, opening, { sessionId: 'x' });
+    await step(env, [...opening, first.msg, user('two')], { sessionId: 'y' });
+    const pids = env.log().filter((l) => l.kind === 'spawn').map((l) => l.pid);
+    assert.equal(pids.length, 2, 'the other session got a process of its own');
+    await new Promise((r) => setTimeout(r, 300));
+    assert.doesNotThrow(() => process.kill(pids[0], 0), "and this session's process was left alone");
+  } finally { await env.service.close(); }
+});
+
 test('a process started with no tools (a reviewer, a compaction) is stopped after oneShotIdleMs; one with tools stays', async () => {
   const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }] }], { idleMs: 60_000, oneShotIdleMs: 100 });
   try {

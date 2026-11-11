@@ -2,7 +2,7 @@
 
 A [pi](https://github.com/earendil-works/pi) extension that serves your own Claude subscription to pi as a model provider, `claude-subscription`, through the unmodified Claude Code binary.
 
-- It runs one warm Claude Code process per conversation, kept across tool rounds and prompts, so the prompt cache keeps working.
+- It runs one warm Claude Code process per conversation, kept across tool rounds and prompts, so the prompt cache keeps working. A reviewer or compaction call that resends the conversation, or another session with the same opening, never takes or closes it.
 - pi runs every tool: Claude Code's own tools are off, and pi's tools reach Claude through an in-process MCP bridge. pi's approvals, extensions and subagents apply. Parallel tool calls, images both ways, thinking, abort and several conversations at once work.
 - It uses a pinned Claude Code release (2.1.311) from the npm registry, checked against a pinned hash. It downloads it only when you run `/claude-login` and say yes.
 - You sign in through Claude Code's own login, in a folder of the extension's own, separate from your `~/.claude`.
