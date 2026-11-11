@@ -55,6 +55,10 @@ Settings apply from the next Claude turn.
 
 Off (the default), pi's system prompt replaces Claude Code's. On (`/claude-context on`), Claude Code keeps its own system prompt and pi's is added after it.
 
+## System prompt changes and the cache
+
+The system prompt is the start of every request, so changing it loses the prompt cache. When pi or an extension changes the prompt mid-conversation (added instructions, or a named section replaced or removed), the warm Claude Code process keeps the prompt it started with, and the change goes in with your next message as one `<system-reminder>` block, the convention Claude Code itself uses for context that changes while its system prompt stays fixed. A new process with the whole current prompt starts only when the base prompt itself changes, or after 32,000 characters of such reminders to one process.
+
 ## The Extra Usage brake
 
 Anthropic can bill a request to Extra Usage (usage credits) instead of your plan: when a plan window is used up and Extra Usage is on, or when it classifies the request as third-party app usage. Claude Code reports this on each response, and the extension acts on it by the `extraUsage` mode:

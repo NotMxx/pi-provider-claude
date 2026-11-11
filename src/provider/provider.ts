@@ -2,8 +2,13 @@
 // calls as pi-ai's events, usage and a stop reason in the final message. Underneath, each conversation is a warm
 // `claude` process (see claude-process.ts); a tool call Claude makes is handed to pi's own agent loop, and its result,
 // which arrives with the next `streamSimple`, goes back into the same process, so the prompt cache keeps working turn
-// after turn. Model, effort and tools change inside the warm process; only a new system prompt, thinking switched on or
-// off, a new output limit or the Claude Code context switch needs a new one.
+// after turn. Model, effort and tools change inside the warm process; only a new leading system prompt, thinking
+// switched on or off, a new output limit or the Claude Code context switch needs a new one.
+//
+// The system prompt is the start of every request, so a warm process keeps the one it started with. A change pi makes
+// later in the conversation (a system message adding instructions, or replacing or removing a named section) goes in
+// with the next user input as one `<system-reminder>` block, as Claude Code itself brings in changing context, so the
+// cached prefix stays valid. Past `maxReminderChars` of reminders, a new process starts from the whole current prompt.
 //
 // pi-ai's request hooks on a process-backed provider: Claude Code builds and sends the HTTP request itself, so
 // `onPayload` is called once per turn with what goes to Claude Code (model, prompt, tools, effort, the resumed history
@@ -22,7 +27,7 @@ import {
 import { claudeEnv, PROVIDER_ID, type DataPaths } from '../env.ts';
 import { readClaudeSettings, type ClaudeSettings } from '../settings.ts';
 import { ClaudeProcess, type McpTool, type ToolResult } from './claude-process.ts';
-import { TOOL_PREFIX, fingerprint, sessionFile, toAnthropic, toolId, type Message } from './history.ts';
+import { TOOL_PREFIX, fingerprint, sessionFile, systemKey, systemReminder, toAnthropic, toolId, type Message } from './history.ts';
 
 export interface ServiceOptions {
   paths: DataPaths;
@@ -41,6 +46,11 @@ export interface ServiceOptions {
   oneShotIdleMs?: number;
   /** How the owner is warned about, and asked to accept, a turn billed to Extra Usage (see `ExtraUsageHooks`). */
   extraUsage?: ExtraUsageHooks;
+  /**
+   * The most characters of `<system-reminder>` blocks one warm process is sent for system prompt changes; past it, a new
+   * process starts with the whole current prompt as its baseline (default 32,000).
+   */
+  maxReminderChars?: number;
 }
 
 /**
@@ -140,8 +150,13 @@ const isAlive = (pid: number) => {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
 };
 
-/** A pooled process: its settings, the pi session it serves, and whether it started with no tools (a one-shot call). */
-type Pooled = ClaudeProcess & { configKey: string; session?: string; oneShot: boolean };
+/**
+ * A pooled process: its settings, the pi session it serves, whether it started with no tools (a one-shot call), the
+ * system messages it has been given (its prompt, then those sent as reminders; `systemKey` each) and the characters of
+ * reminders sent to it.
+ */
+type Pooled = ClaudeProcess & { configKey: string; session?: string; oneShot: boolean; system: string[]; reminded: number };
+type SystemState = { messages: Message[]; keys: string[] };
 type Want = { model: string; effort?: string; tools: McpTool[] };
 
 export function openClaudeService(options: ServiceOptions): ClaudeService {
@@ -155,6 +170,7 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
   const idleMs = options.idleMs ?? 10 * 60_000;
   const oneShotIdleMs = options.oneShotIdleMs ?? 30_000;
   const maxProcesses = options.maxProcesses ?? 8;
+  const maxReminderChars = options.maxReminderChars ?? 32_000;
   const pool = new Set<Pooled>();
   let reap: NodeJS.Timeout | undefined;
 
@@ -205,7 +221,10 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
       const maxTokens = opts.maxTokens;
       const want: Want = { model: model.id, effort, tools };
       const current = settings();
-      const configKey = createHash('sha256').update(JSON.stringify([systemPrompt, Boolean(effort), maxTokens, current.claudeCodeContext])).digest('hex');
+      // The system prompt is not part of it: a warm process takes later system messages as reminders.
+      const configKey = createHash('sha256').update(JSON.stringify([Boolean(effort), maxTokens, current.claudeCodeContext])).digest('hex');
+      const systemMessages = context.messages.filter((m) => m.role === 'system') as unknown as Message[];
+      const system: SystemState = { messages: systemMessages, keys: systemMessages.map(systemKey) };
       const fps = conversation.map(fingerprint);
       // A session that declined Extra Usage is not sent again (on any model) until it is accepted for the session.
       const sessionKey = opts.sessionId ?? `conversation:${fps[0] ?? 'empty'}`;
@@ -215,7 +234,7 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
         model: model.id, systemPrompt, claudeCodeContext: current.claudeCodeContext, effort, maxTokens, tools, ...(history ? { history } : {}), input,
       }, model);
 
-      proc = await continueWarm(configKey, want, conversation, fps, payload);
+      proc = await continueWarm(configKey, want, system, conversation, fps, payload);
       if (!proc) {
         const claudePath = await options.binary();
         if (closed) throw new Error(`${PROVIDER_ID} provider is closed`);
@@ -234,15 +253,16 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
           claudePath, env: claudeEnv(paths, maxTokens ? { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxTokens) } : {}, { ...process.env, ...opts.env }),
           model: model.id, systemPrompt, claudeCodeContext: current.claudeCodeContext, tools, effort, cwd, runDir,
           session: history.length ? sessionFile(history, cwd, model.id) : undefined,
-        }), { configKey, session: opts.sessionId, oneShot: tools.length === 0 });
+        }), { configKey, session: opts.sessionId, oneShot: tools.length === 0, system: system.keys, reminded: 0 });
         const spawned = proc;
         void spawned.exited.then(() => pool.delete(spawned));
         // This session's conversation went somewhere its idle processes cannot follow (a compaction, a branch): they
-        // would never be continued. Only those with the same settings: a reviewer or compaction call of the same
-        // session has its own system prompt and must not end the conversation's warm process.
+        // would never be continued. Only those with the same settings and leading prompt: a reviewer or compaction call
+        // of the same session has its own system prompt and must not end the conversation's warm process.
         if (opts.sessionId !== undefined) {
           for (const p of pool) {
-            if (p.session === opts.sessionId && p.configKey === configKey && !p.busy && !p.awaiting.length) { pool.delete(p); void p.stop(); }
+            if (p.session === opts.sessionId && p.configKey === configKey && p.system[0] === spawned.system[0]
+              && !p.busy && !p.awaiting.length) { pool.delete(p); void p.stop(); }
           }
         }
         if (pool.size >= maxProcesses) {
@@ -278,14 +298,19 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
     }
   }
 
-  /** A warm process that has seen everything but the newest input, and is in a state to take it. */
-  async function continueWarm(configKey: string, want: Want, conversation: Message[], fps: string[], payload: (input: unknown) => unknown) {
+  /**
+   * A warm process that has seen everything but the newest input, and is in a state to take it. Its system messages
+   * must be the first of the current ones; the others go in with the next user input as a reminder (after tool results,
+   * which reach Claude Code as answers to its calls, they wait for that input).
+   */
+  async function continueWarm(configKey: string, want: Want, system: SystemState, conversation: Message[], fps: string[], payload: (input: unknown) => unknown) {
     for (const p of pool) {
       if (!p.alive) { pool.delete(p); continue; }
       if (p.busy || p.seen.length >= fps.length) continue;
       if (!p.seen.every((f, i) => f === fps[i])) continue;
       const rest = conversation.slice(p.seen.length);
-      if (p.configKey === configKey && p.awaiting.length && rest.every((m) => m?.role === 'toolResult')) {
+      const fits = p.configKey === configKey && p.system.length <= system.keys.length && p.system.every((k, i) => k === system.keys[i]);
+      if (fits && p.awaiting.length && rest.every((m) => m?.role === 'toolResult')) {
         const results = new Map<string, ToolResult>(rest.map((m: any) => [toolId(m.toolCallId), m as ToolResult]));
         if (p.awaiting.every((a) => results.has(a.id))) {
           p.busy = true;
@@ -297,16 +322,20 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
       }
       // New user messages, one or several at once (pi can add a note or a background agent's wake beside the prompt):
       // they go in as one input, in order, as the history conversion merges consecutive user messages.
-      if (p.configKey === configKey && !p.awaiting.length && rest.length && rest.every((m) => m?.role === 'user')) {
+      // A system prompt change since its last input goes first, as a reminder, while the reminders stay within the cap.
+      const reminder = fits ? systemReminder(system.messages.slice(p.system.length)) : '';
+      if (fits && !p.awaiting.length && rest.length && rest.every((m) => m?.role === 'user') && p.reminded + reminder.length <= maxReminderChars) {
         p.busy = true;
         await updateOrRetire(p, want);
-        const input = toAnthropic(rest)[0]?.content ?? [];
+        const input = [...(reminder ? [{ type: 'text', text: reminder }] : []), ...(toAnthropic(rest)[0]?.content ?? [])];
         await payload(input);
         p.send(input);
+        p.system = system.keys;
+        p.reminded += reminder.length;
         return p;
       }
       // The conversation went on past what this process can take (a message pi added after the tool results, a new
-      // prompt or setting): a new process resumes it, and this one would never be continued.
+      // leading prompt or setting, too many reminders): a new process resumes it, and this one would never be continued.
       pool.delete(p);
       void p.stop();
     }

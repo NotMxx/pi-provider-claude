@@ -20,7 +20,7 @@ export type ThinkingPart = { type: 'thinking'; thinking: string; thinkingSignatu
 export type ToolCallPart = { type: 'toolCall'; id: string; name: string; arguments: unknown };
 export type AssistantPart = TextPart | ThinkingPart | ToolCallPart;
 export type Message =
-  | { role: 'system'; content?: unknown }
+  | { role: 'system'; content?: unknown; sections?: Record<string, string | null> }
   | { role: 'user'; content: string | Array<TextPart | ImagePart> }
   | { role: 'assistant'; content: AssistantPart[]; stopReason?: string; provider?: string; model?: string }
   | { role: 'toolResult'; toolCallId: string; content: string | Array<TextPart | ImagePart>; isError?: boolean };
@@ -123,4 +123,35 @@ export function fingerprint(m: Message): string {
     return canonical(['a', failed(m) ? 'failed' : '', parts]);
   }
   return canonical(['s', (m as { content?: unknown })?.content]);
+}
+
+/** What a system message says to the model (its text and sections); its tool changes reach Claude Code on their own. */
+export const systemKey = (m: Message): string =>
+  canonical(['s', (m as { content?: unknown }).content ?? '', (m as { sections?: unknown }).sections ?? {}]);
+
+const contentText = (content: unknown) =>
+  typeof content === 'string' ? content : list<any>(content).filter((c) => c?.type === 'text').map((c) => String(c.text)).join('\n');
+
+/**
+ * A later system message as pi-ai renders it for a model that takes system messages mid-conversation
+ * (`renderSystemMessageUpdate`): its instructions, then each section it replaces or removes, named. A copy, so the
+ * extension does not depend on pi-ai giving extensions that helper (pi 0.99.1 is the oldest pi supported).
+ */
+export function renderSystemUpdate(m: Message): string {
+  const parts: string[] = [];
+  const text = contentText((m as { content?: unknown }).content);
+  if (text.length > 0) parts.push(text);
+  for (const [name, value] of Object.entries((m as { sections?: Record<string, string | null> }).sections ?? {})) {
+    parts.push(value === null ? `Removed system prompt section "${name}".` : `Updated system prompt section "${name}":\n\n${value}`);
+  }
+  return parts.join('\n\n');
+}
+
+/**
+ * Later system messages as one `<system-reminder>` block, the way Claude Code itself brings changing context into a
+ * conversation whose system prompt stays fixed; empty when they say nothing (tool changes only).
+ */
+export function systemReminder(messages: Message[]): string {
+  const text = messages.map(renderSystemUpdate).filter((t) => t.length > 0).join('\n\n');
+  return text ? `<system-reminder>\n${text}\n</system-reminder>` : '';
 }

@@ -7,7 +7,7 @@ import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSyn
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, test as nodeTest } from 'node:test';
-import { normalizeContext, type AssistantMessageEvent, type Message, type SimpleStreamOptions } from '@earendil-works/pi-ai';
+import { normalizeContext, renderSystemMessageUpdate, type AssistantMessageEvent, type Message, type SimpleStreamOptions } from '@earendil-works/pi-ai';
 import { CLAUDE_CODE_VERSION, dataPaths, PROVIDER_ID } from '../../src/env.ts';
 import { claudeModel } from '../../src/models.ts';
 import { writeClaudeSettings, type ClaudeSettings } from '../../src/settings.ts';
@@ -20,7 +20,7 @@ const FAKE = join(import.meta.dirname, '..', 'fixtures', 'fake-claude.mjs');
 const roots: string[] = [];
 after(() => { for (const r of roots) rmSync(r, { recursive: true, force: true }); });
 
-type Options = { binary?: string; settings?: () => ClaudeSettings; maxProcesses?: number; idleMs?: number; oneShotIdleMs?: number; extraUsage?: ExtraUsageHooks };
+type Options = { binary?: string; settings?: () => ClaudeSettings; maxProcesses?: number; idleMs?: number; oneShotIdleMs?: number; extraUsage?: ExtraUsageHooks; maxReminderChars?: number };
 
 /** A service whose `claude` is the fake, following `script`; `log()` returns what the fake was given. */
 function setup(script: unknown[], options: Options = {}) {
@@ -30,7 +30,7 @@ function setup(script: unknown[], options: Options = {}) {
   mkdirSync(paths.configDir, { recursive: true });
   writeFileSync(join(paths.configDir, 'script.json'), JSON.stringify(script));
   const binary = options.binary ?? FAKE;
-  const service = openClaudeService({ paths, binary: async () => binary, settings: options.settings, maxProcesses: options.maxProcesses, idleMs: options.idleMs, oneShotIdleMs: options.oneShotIdleMs, extraUsage: options.extraUsage });
+  const service = openClaudeService({ paths, binary: async () => binary, settings: options.settings, maxProcesses: options.maxProcesses, idleMs: options.idleMs, oneShotIdleMs: options.oneShotIdleMs, extraUsage: options.extraUsage, maxReminderChars: options.maxReminderChars });
   const logFile = join(paths.configDir, 'log.jsonl');
   const log = (): any[] => existsSync(logFile) ? readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
   return { root, paths, service, log };
@@ -251,7 +251,7 @@ test('an image a warm tool call returns reaches Claude Code as MCP image content
   } finally { await env.service.close(); }
 });
 
-test('model, effort and tools change inside the warm process; only a new system prompt starts another', async () => {
+test('model, effort and tools change inside the warm process; only a new leading system prompt starts another', async () => {
   const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }, { text: 'd' }, { text: 'e' }] }]);
   try {
     const messages: Message[] = [user('one')];
@@ -261,7 +261,7 @@ test('model, effort and tools change inside the warm process; only a new system 
     messages.push((await step(env, messages, { reasoning: 'high', tools: tools.slice(0, 1), model: 'claude-sonnet-5-5' })).msg, user('five'));
     await step(env, messages, { reasoning: 'high', tools: tools.slice(0, 1), model: 'claude-sonnet-5-5', systemPrompt: 'You are pi, now terser.' });
     const log = env.log();
-    assert.equal(log.filter((l) => l.kind === 'spawn').length, 2, 'only the new system prompt needed a new process');
+    assert.equal(log.filter((l) => l.kind === 'spawn').length, 2, 'only the new leading system prompt needed a new process');
     const controls = log.filter((l) => l.kind === 'stdin' && l.msg.type === 'control_request').map((l) => l.msg.request);
     assert.deepEqual(controls.filter((r) => r.subtype === 'apply_flag_settings').map((r) => r.settings), [{ effortLevel: 'high' }]);
     assert.deepEqual(controls.filter((r) => r.subtype === 'set_model').map((r) => r.model), ['claude-sonnet-5-5']);
@@ -588,6 +588,103 @@ test('a model of another provider is refused', async () => {
     const stream = env.service.streamSimple({ ...claudeModel('claude-haiku-5-5')!, provider: 'other' }, normalizeContext({ messages: [user('one')] }), {});
     assert.match((await stream.result()).errorMessage!, /other/);
     assert.equal(env.log().filter((l) => l.kind === 'spawn').length, 0);
+  } finally { await env.service.close(); }
+});
+
+// A later system message (pi's section patches, an extension's added instructions) does not restart Claude Code: the
+// warm process keeps the prompt it started with, and the change goes in with the next input as a <system-reminder>.
+const sys = (content: string, sections?: Record<string, string | null>): Message =>
+  ({ role: 'system', content, ...(sections ? { sections } : {}), timestamp: Date.now() });
+const reminder = (text: string) => ({ type: 'text', text: `<system-reminder>\n${text}\n</system-reminder>` });
+const userInputs = (env: Env) => env.log().filter((l) => l.kind === 'stdin' && l.msg.type === 'user').map((l) => l.msg.message.content);
+
+for (const claudeCodeContext of [false, true]) {
+  test(`added instructions reach the warm process as a <system-reminder> before the next input (context ${claudeCodeContext ? 'on' : 'off'})`, async () => {
+    const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }] }], { settings: () => ({ claudeCodeContext, extraUsage: 'strict' }) });
+    try {
+      const messages: Message[] = [user('one')];
+      messages.push((await step(env, messages)).msg, sys('Answer in Spanish.'), sys('Be brief.'), user('two'));
+      messages.push((await step(env, messages)).msg, user('three'));
+      await step(env, messages);
+      const log = env.log();
+      assert.equal(log.filter((l) => l.kind === 'spawn').length, 1, 'the same warm process all along');
+      const init = log.filter((l) => l.kind === 'initialize');
+      assert.deepEqual(init.map((l) => l.system), ['You are pi.'], 'the process keeps the prompt it started with');
+      assert.deepEqual(userInputs(env), [
+        [{ type: 'text', text: 'one' }],
+        [reminder('Answer in Spanish.\n\nBe brief.'), { type: 'text', text: 'two' }],
+        [{ type: 'text', text: 'three' }],
+      ], 'only the new instructions, once; an unchanged prompt adds nothing');
+    } finally { await env.service.close(); }
+  });
+}
+
+test('a replaced and a removed prompt section are described as such, as pi renders them', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }] }]);
+  try {
+    const added = sys('', { style: '<style>terse</style>', rules: '<rules>no emojis</rules>' });
+    const changed = sys('', { style: '<style>verbose</style>', rules: null });
+    const messages: Message[] = [user('one')];
+    messages.push((await step(env, messages)).msg, added, user('two'));
+    messages.push((await step(env, messages)).msg, changed, user('three'));
+    await step(env, messages);
+    assert.equal(env.log().filter((l) => l.kind === 'spawn').length, 1);
+    const changedText = 'Updated system prompt section "style":\n\n<style>verbose</style>\n\nRemoved system prompt section "rules".';
+    assert.equal(renderSystemMessageUpdate(changed as never), changedText, 'the same text pi-ai renders');
+    assert.deepEqual(userInputs(env).slice(1), [
+      [reminder(renderSystemMessageUpdate(added as never)), { type: 'text', text: 'two' }],
+      [reminder(changedText), { type: 'text', text: 'three' }],
+    ]);
+  } finally { await env.service.close(); }
+});
+
+test('a changed leading system prompt starts a new process with the whole current prompt, and no reminder', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }] }], { idleMs: 60_000 });
+  try {
+    const messages: Message[] = [user('one')];
+    messages.push((await step(env, messages)).msg, sys('Be brief.'), user('two'));
+    await step(env, messages, { systemPrompt: 'You are pi, now terser.' });
+    const log = env.log();
+    const spawns = log.filter((l) => l.kind === 'spawn');
+    assert.equal(spawns.length, 2);
+    assert.deepEqual(log.filter((l) => l.kind === 'initialize').map((l) => l.system), ['You are pi.', 'You are pi, now terser.\n\nBe brief.']);
+    assert.deepEqual(userInputs(env).at(-1), [{ type: 'text', text: 'two' }]);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.throws(() => process.kill(spawns[0].pid, 0), 'the old process, which can never be continued, was closed');
+  } finally { await env.service.close(); }
+});
+
+test('reminders past maxReminderChars for one process start a new one with the whole current prompt', async () => {
+  // The first reminder block is 55 characters; the second would pass 60.
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }, { text: 'd' }] }], { maxReminderChars: 60 });
+  try {
+    const messages: Message[] = [user('one')];
+    messages.push((await step(env, messages)).msg, sys('Answer in Spanish.'), user('two'));
+    messages.push((await step(env, messages)).msg, sys('Be brief.'), user('three'));
+    messages.push((await step(env, messages)).msg, sys('Use metric units.'), user('four'));
+    await step(env, messages);
+    const log = env.log();
+    assert.equal(log.filter((l) => l.kind === 'spawn').length, 2, 'one new process, then warm again from the new baseline');
+    assert.deepEqual(log.filter((l) => l.kind === 'initialize').map((l) => l.system),
+      ['You are pi.', 'You are pi.\n\nAnswer in Spanish.\n\nBe brief.']);
+    assert.deepEqual(userInputs(env).slice(1), [
+      [reminder('Answer in Spanish.'), { type: 'text', text: 'two' }],
+      [{ type: 'text', text: 'three' }],
+      [reminder('Use metric units.'), { type: 'text', text: 'four' }],
+    ]);
+  } finally { await env.service.close(); }
+});
+
+test('a system message added while a tool runs waits for the next user input of the same process', async () => {
+  const env = setup([{ steps: [{ toolCalls: [{ name: 'read_note', args: { name: 'n' } }] }, { text: 'Read.' }, { text: 'Bye.' }] }]);
+  try {
+    const messages: Message[] = [user('Read my note')];
+    const first = await step(env, messages);
+    messages.push(first.msg, result('toolu_fake_1_0', 'read_note', 'text'), sys('Be brief.'));
+    messages.push((await step(env, messages)).msg, user('Thanks'));
+    await step(env, messages);
+    assert.equal(env.log().filter((l) => l.kind === 'spawn').length, 1);
+    assert.deepEqual(userInputs(env), [[{ type: 'text', text: 'Read my note' }], [reminder('Be brief.'), { type: 'text', text: 'Thanks' }]]);
   } finally { await env.service.close(); }
 });
 
