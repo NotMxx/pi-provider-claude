@@ -34,6 +34,11 @@ export interface ServiceOptions {
   maxProcesses?: number;
   /** A warm process with nothing to do is closed after this long (default 10 minutes). */
   idleMs?: number;
+  /**
+   * The same for a process started with no tools, a one-shot call such as a reviewer or a compaction (default 30
+   * seconds). A full pool evicts these first, so they never push out a conversation's warm process.
+   */
+  oneShotIdleMs?: number;
   /** How the owner is warned about, and asked to accept, a turn billed to Extra Usage (see `ExtraUsageHooks`). */
   extraUsage?: ExtraUsageHooks;
 }
@@ -77,10 +82,13 @@ const WINDOWS: Record<string, string> = {
 
 type RateLimitInfo = { status?: string; rateLimitType?: string; resetsAt?: number; isUsingOverage?: boolean; overageInUse?: boolean };
 
-/** The error a turn ends with when the plan limit is reached: the window, and when it resets in local time. */
+/**
+ * The error a turn ends with when the plan limit is reached: the window, and when it resets in local time. It says
+ * "usage limit", which Gentle Shell's subagents read as quota and answer with their fallback model.
+ */
 function limitMessage(info: RateLimitInfo): string {
   const window = info.rateLimitType ? WINDOWS[info.rateLimitType] : undefined;
-  let text = `Claude subscription limit reached${window ? ` (${window} window)` : ''}`;
+  let text = `Claude subscription usage limit reached${window ? ` (${window} window)` : ''}`;
   if (typeof info.resetsAt === 'number' && Number.isFinite(info.resetsAt)) {
     // Seconds since the epoch; a value already in milliseconds is taken as it is.
     const at = new Date(info.resetsAt < 1e12 ? info.resetsAt * 1000 : info.resetsAt);
@@ -127,7 +135,8 @@ const isAlive = (pid: number) => {
   try { process.kill(pid, 0); return true; } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
 };
 
-type Pooled = ClaudeProcess & { configKey: string };
+/** A pooled process: its settings, the pi session it serves, and whether it started with no tools (a one-shot call). */
+type Pooled = ClaudeProcess & { configKey: string; session?: string; oneShot: boolean };
 type Want = { model: string; effort?: string; tools: McpTool[] };
 
 export function openClaudeService(options: ServiceOptions): ClaudeService {
@@ -139,6 +148,7 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
   let closed = false;
   let started = false;
   const idleMs = options.idleMs ?? 10 * 60_000;
+  const oneShotIdleMs = options.oneShotIdleMs ?? 30_000;
   const maxProcesses = options.maxProcesses ?? 8;
   const pool = new Set<Pooled>();
   let reap: NodeJS.Timeout | undefined;
@@ -154,11 +164,12 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
         if (pid === undefined || (pid !== process.pid && !isAlive(pid))) rmSync(join(paths.runDir, name), { recursive: true, force: true });
       }
     } catch { /* no run folder yet */ }
-    // A process waiting for one of pi's tools is kept as long as the tool may take; an idle one for idleMs.
-    const expired = (p: ClaudeProcess) => Date.now() - p.lastUsed > (p.awaiting.length ? 24 * 3600_000 : idleMs);
+    // A process waiting for one of pi's tools is kept as long as the tool may take; an idle one for idleMs, or
+    // oneShotIdleMs when it started with no tools.
+    const expired = (p: Pooled) => Date.now() - p.lastUsed > (p.awaiting.length ? 24 * 3600_000 : p.oneShot ? oneShotIdleMs : idleMs);
     reap = setInterval(() => {
       for (const p of pool) if (!p.busy && expired(p)) { pool.delete(p); void p.stop(); }
-    }, Math.min(idleMs, 60_000));
+    }, Math.min(idleMs, oneShotIdleMs, 60_000));
     reap.unref();
   }
 
@@ -214,12 +225,22 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
           claudePath, env: claudeEnv(paths, maxTokens ? { CLAUDE_CODE_MAX_OUTPUT_TOKENS: String(maxTokens) } : {}, { ...process.env, ...opts.env }),
           model: model.id, systemPrompt, claudeCodeContext: current.claudeCodeContext, tools, effort, cwd, runDir,
           session: history.length ? sessionFile(history, cwd, model.id) : undefined,
-        }), { configKey });
+        }), { configKey, session: opts.sessionId, oneShot: tools.length === 0 });
         const spawned = proc;
         void spawned.exited.then(() => pool.delete(spawned));
+        // This session's conversation went somewhere its idle processes cannot follow (a compaction, a branch): they
+        // would never be continued. Only those with the same settings: a reviewer or compaction call of the same
+        // session has its own system prompt and must not end the conversation's warm process.
+        if (opts.sessionId !== undefined) {
+          for (const p of pool) {
+            if (p.session === opts.sessionId && p.configKey === configKey && !p.busy && !p.awaiting.length) { pool.delete(p); void p.stop(); }
+          }
+        }
         if (pool.size >= maxProcesses) {
-          // Least recently used first, and one that waits for a tool only when nothing else can go.
-          const idle = [...pool].filter((p) => !p.busy).sort((a, b) => Number(a.awaiting.length > 0) - Number(b.awaiting.length > 0) || a.lastUsed - b.lastUsed)[0];
+          // One-shot processes first, then the least recently used, and one that waits for a tool only when nothing
+          // else can go.
+          const idle = [...pool].filter((p) => !p.busy).sort((a, b) => Number(a.awaiting.length > 0) - Number(b.awaiting.length > 0)
+            || Number(b.oneShot) - Number(a.oneShot) || a.lastUsed - b.lastUsed)[0];
           if (idle) { pool.delete(idle); void idle.stop(); }
         }
         pool.add(proc);
@@ -265,7 +286,9 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
           return p;
         }
       }
-      if (p.configKey === configKey && !p.awaiting.length && rest.length === 1 && rest[0]?.role === 'user') {
+      // New user messages, one or several at once (pi can add a note or a background agent's wake beside the prompt):
+      // they go in as one input, in order, as the history conversion merges consecutive user messages.
+      if (p.configKey === configKey && !p.awaiting.length && rest.length && rest.every((m) => m?.role === 'user')) {
         p.busy = true;
         await updateOrRetire(p, want);
         const input = toAnthropic(rest)[0]?.content ?? [];

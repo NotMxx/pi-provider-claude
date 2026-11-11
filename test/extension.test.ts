@@ -13,7 +13,8 @@ import { scratch } from './fixtures/scratch.ts';
 
 const test = (name: string, fn: () => void | Promise<void>) => nodeTest(name, { timeout: 15_000 }, fn);
 const FAKE = join(import.meta.dirname, 'fixtures', 'fake-claude.mjs');
-const PLUGIN_MODELS = ['claude-fable-5-1', 'claude-opus-5-5', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'];
+// Opus 5.5 first: pi (and Gentle Shell's subagents without a route) takes the first model when none is set.
+const PLUGIN_MODELS = ['claude-opus-5-5', 'claude-fable-5-1', 'claude-sonnet-5-5', 'claude-haiku-5-5', 'claude-fable-5', 'claude-opus-5', 'claude-sonnet-5'];
 
 /** A fake pi API recording registrations, and a UI context recording what the extension shows and asks. */
 function load(paths: DataPaths, ui: { confirm?: boolean[]; inputs?: (string | undefined)[] } = {}) {

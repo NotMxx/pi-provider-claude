@@ -5,9 +5,10 @@ import { API_ID, PROVIDER_ID } from './env.ts';
 
 type Entry = { id: string; name: string; thinkingLevelMap: Model<string>['thinkingLevelMap'] };
 
+// Opus 5.5 first: pi takes the first model when none is set (as Gentle Shell's subagents without a route do).
 const ENTRIES: Entry[] = [
-  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', thinkingLevelMap: { off: null, xhigh: 'xhigh', max: 'max' } },
   { id: 'claude-opus-5-5', name: 'Claude Opus 5.5', thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } },
+  { id: 'claude-fable-5-1', name: 'Claude Fable 5.1', thinkingLevelMap: { off: null, xhigh: 'xhigh', max: 'max' } },
   { id: 'claude-sonnet-5-5', name: 'Claude Sonnet 5.5', thinkingLevelMap: { off: null, minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } },
   { id: 'claude-haiku-5-5', name: 'Claude Haiku 5.5', thinkingLevelMap: { minimal: null, low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' } },
   { id: 'claude-fable-5', name: 'Claude Fable 5', thinkingLevelMap: { off: null, xhigh: 'xhigh', max: 'max' } },

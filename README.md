@@ -27,6 +27,18 @@ Then, in pi:
 
 Until you sign in, a turn on these models ends with an error that tells you to run `/claude-login`. Nothing downloads on its own.
 
+When no model is set, pi takes the first one, `claude-opus-5-5`.
+
+## Gentle Shell
+
+Checked with Gentle Shell 4.7.0 on pi 1.5.2, subagents and reviewers included.
+
+- Install it as a package, so subagents load it too: `gentle-shell install git:github.com/NotMxx/pi-provider-claude`. An extension passed with `-e` is not passed to subagents.
+- Run `/claude-login` once inside Gentle Shell. It keeps its data in `~/.gentle-shell/agent/pi-provider-claude`, separate from pi's.
+- Subagents with no model route use Opus 5.5. Set a default model, or a subagent `default_model`, to use another.
+- A reached plan limit says "usage limit", which Gentle Shell reads as quota and may answer with its fallback model.
+- A subagent has no UI, so it cannot answer the Extra Usage question. In `ask` mode a subagent turn billed to Extra Usage fails (Gentle Shell treats it as quota and may fall back), unless the parent has a UI or the mode is `allow`.
+
 ## Commands
 
 | Command | What it does |

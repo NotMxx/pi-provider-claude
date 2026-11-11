@@ -20,7 +20,7 @@ const FAKE = join(import.meta.dirname, '..', 'fixtures', 'fake-claude.mjs');
 const roots: string[] = [];
 after(() => { for (const r of roots) rmSync(r, { recursive: true, force: true }); });
 
-type Options = { binary?: string; settings?: () => ClaudeSettings; maxProcesses?: number; idleMs?: number; extraUsage?: ExtraUsageHooks };
+type Options = { binary?: string; settings?: () => ClaudeSettings; maxProcesses?: number; idleMs?: number; oneShotIdleMs?: number; extraUsage?: ExtraUsageHooks };
 
 /** A service whose `claude` is the fake, following `script`; `log()` returns what the fake was given. */
 function setup(script: unknown[], options: Options = {}) {
@@ -30,7 +30,7 @@ function setup(script: unknown[], options: Options = {}) {
   mkdirSync(paths.configDir, { recursive: true });
   writeFileSync(join(paths.configDir, 'script.json'), JSON.stringify(script));
   const binary = options.binary ?? FAKE;
-  const service = openClaudeService({ paths, binary: async () => binary, settings: options.settings, maxProcesses: options.maxProcesses, idleMs: options.idleMs, extraUsage: options.extraUsage });
+  const service = openClaudeService({ paths, binary: async () => binary, settings: options.settings, maxProcesses: options.maxProcesses, idleMs: options.idleMs, oneShotIdleMs: options.oneShotIdleMs, extraUsage: options.extraUsage });
   const logFile = join(paths.configDir, 'log.jsonl');
   const log = (): any[] => existsSync(logFile) ? readFileSync(logFile, 'utf8').trim().split('\n').map((l) => JSON.parse(l)) : [];
   return { root, paths, service, log };
@@ -508,6 +508,73 @@ test('an idle process is stopped after idleMs; one awaiting a tool result is kep
   } finally { await env.service.close(); }
 });
 
+test('several user messages pi adds at once (a subagent wake, a note) continue the warm process as one input, in order', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }] }]);
+  try {
+    const image = { type: 'image' as const, data: 'aGk=', mimeType: 'image/png' };
+    const messages: Message[] = [user('one')];
+    messages.push((await step(env, messages)).msg, user('Background agent finished.'),
+      { role: 'user', content: [{ type: 'text', text: 'Reply in English.' }, image], timestamp: 1 });
+    const r = await step(env, messages);
+    assert.deepEqual(r.msg.content, [{ type: 'text', text: 'b' }]);
+    assert.equal(env.log().filter((l) => l.kind === 'spawn').length, 1, 'the warm process is reused');
+    const block = { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'aGk=' } };
+    assert.deepEqual(env.log().filter((l) => l.kind === 'stdin' && l.msg.type === 'user').map((l) => l.msg.message.content),
+      [[{ type: 'text', text: 'one' }], [{ type: 'text', text: 'Background agent finished.' }, { type: 'text', text: 'Reply in English.' }, block]]);
+  } finally { await env.service.close(); }
+});
+
+test('a shorter history for the same session (after compaction) starts a new process and closes the old one', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }] }], { idleMs: 60_000 });
+  try {
+    const messages: Message[] = [user('one')];
+    messages.push((await step(env, messages)).msg, user('two'));
+    messages.push((await step(env, messages)).msg);
+    const r = await step(env, [user('Summary of the conversation so far.'), user('three')]);
+    assert.deepEqual(r.msg.content, [{ type: 'text', text: 'c' }]);
+    const [old, fresh] = env.log().filter((l) => l.kind === 'spawn').map((l) => l.pid);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.throws(() => process.kill(old, 0), 'the process of the longer history was closed');
+    assert.doesNotThrow(() => process.kill(fresh, 0), 'the new one stays warm');
+  } finally { await env.service.close(); }
+});
+
+test('a new process of another session leaves this session\'s warm process alone', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }] }], { idleMs: 60_000 });
+  try {
+    await step(env, [user('one')], { sessionId: 'x' });
+    await step(env, [user('two')], { sessionId: 'y' });
+    await new Promise((r) => setTimeout(r, 300));
+    for (const pid of env.log().filter((l) => l.kind === 'spawn').map((l) => l.pid)) assert.doesNotThrow(() => process.kill(pid, 0));
+  } finally { await env.service.close(); }
+});
+
+test('a process started with no tools (a reviewer, a compaction) is stopped after oneShotIdleMs; one with tools stays', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }] }], { idleMs: 60_000, oneShotIdleMs: 100 });
+  try {
+    await step(env, [user('review')], { systemPrompt: 'reviewer', tools: [], sessionId: 'r' });
+    await step(env, [user('work')], { systemPrompt: 'main', sessionId: 'm' });
+    const [oneShot, main] = env.log().filter((l) => l.kind === 'spawn').map((l) => l.pid);
+    await new Promise((r) => setTimeout(r, 600));
+    assert.throws(() => process.kill(oneShot, 0), 'the one-shot process was stopped');
+    assert.doesNotThrow(() => process.kill(main, 0), 'the conversation stays warm');
+  } finally { await env.service.close(); }
+});
+
+test('a full pool evicts a process with no tools before an older conversation', async () => {
+  const env = setup([{ steps: [{ text: 'a' }, { text: 'b' }, { text: 'c' }] }], { maxProcesses: 2, idleMs: 60_000 });
+  try {
+    await step(env, [user('work')], { systemPrompt: 'main', sessionId: 'm' });
+    await step(env, [user('review')], { systemPrompt: 'reviewer', tools: [], sessionId: 'r' });
+    await step(env, [user('other')], { systemPrompt: 'other', sessionId: 'o' });
+    const [main, oneShot, other] = env.log().filter((l) => l.kind === 'spawn').map((l) => l.pid);
+    await new Promise((r) => setTimeout(r, 300));
+    assert.throws(() => process.kill(oneShot, 0), 'the one-shot process went first');
+    assert.doesNotThrow(() => process.kill(main, 0), 'the least recently used conversation stays');
+    assert.doesNotThrow(() => process.kill(other, 0));
+  } finally { await env.service.close(); }
+});
+
 test('after close() the service refuses new work instead of starting processes nobody reaps', async () => {
   const env = setup([{ steps: [{ text: 'a' }] }]);
   await env.service.close();
@@ -559,9 +626,12 @@ test('a reached plan limit names its window and when it resets', async () => {
   const resetsAt = Math.floor(new Date(2026, 9, 30, 18, 5).getTime() / 1000);
   const env = setup([{ steps: [{ limit: { rateLimitType: 'five_hour', resetsAt } }, { limit: { rateLimitType: 'seven_day' } }, { limit: {} }] }]);
   try {
-    assert.equal((await step(env, [user('Hi')])).msg.errorMessage, 'Claude subscription limit reached (5-hour window); it resets at 2026-10-30 18:05.');
-    assert.equal((await step(env, [user('Hi again')])).msg.errorMessage, 'Claude subscription limit reached (weekly window).');
-    assert.equal((await step(env, [user('And again')])).msg.errorMessage, 'Claude subscription limit reached.');
+    assert.equal((await step(env, [user('Hi')])).msg.errorMessage, 'Claude subscription usage limit reached (5-hour window); it resets at 2026-10-30 18:05.');
+    assert.equal((await step(env, [user('Hi again')])).msg.errorMessage, 'Claude subscription usage limit reached (weekly window).');
+    const last = (await step(env, [user('And again')])).msg.errorMessage!;
+    assert.equal(last, 'Claude subscription usage limit reached.');
+    // Gentle Shell's subagent error classifier (lib/agents-protocol.ts), which moves to its fallback model on a match.
+    assert.match(last, /quota|billing|out of budget|usage.?limit|credit balance/i, 'Gentle Shell reads a plan limit as quota');
   } finally { await env.service.close(); }
 });
 
@@ -644,7 +714,7 @@ test('"out of extra usage" without a plan-limit rejection says the request was c
     assert.match(r.msg.errorMessage!, /system prompt/);
     assert.match(r.msg.errorMessage!, /\/claude-context on/);
     assert.match(r.msg.errorMessage!, /You're out of extra usage/);
-    assert.match((await step(env, [user('Hi again')])).msg.errorMessage!, /^Claude subscription limit reached \(5-hour window\)/, 'a plan rejection keeps the limit message');
+    assert.match((await step(env, [user('Hi again')])).msg.errorMessage!, /^Claude subscription usage limit reached \(5-hour window\)/, 'a plan rejection keeps the limit message');
   } finally { await env.service.close(); }
 });
 
