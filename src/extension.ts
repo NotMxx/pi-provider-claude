@@ -44,6 +44,8 @@ export function createExtension(options: ExtensionOptions = {}) {
     const paths = options.paths ?? dataPaths();
     // Sessions whose owner accepted Extra Usage (the `ask` mode), in memory only: a new session or a restart asks again.
     const allowed = new Set<string>();
+    // Sessions whose owner declined it: not sent again on any model until allow-session.
+    const declined = new Set<string>();
     // The newest context pi handed the extension, so a turn can warn and ask through pi's UI.
     let latest: ExtensionContext | undefined;
     const remember = (_event: unknown, ctx: ExtensionContext) => { latest = ctx; };
@@ -56,6 +58,7 @@ export function createExtension(options: ExtensionOptions = {}) {
       binary: () => usableBinary(paths),
       extraUsage: {
         allowed,
+        declined,
         async ask(_session, message, signal) {
           try {
             // The dialog closes when the turn is aborted.
@@ -103,7 +106,7 @@ export function createExtension(options: ExtensionOptions = {}) {
         ...(choices ? { getArgumentCompletions: (prefix: string) => choices.filter((c) => c.startsWith(prefix.trim())).map((c) => ({ value: c, label: c })) } : {}),
         handler: async (args, ctx) => {
           latest = ctx;
-          await runCommand(name, args, ownerOf(ctx), paths, { allowSession: (session) => allowed.add(session) }, ctx.sessionManager.getSessionId());
+          await runCommand(name, args, ownerOf(ctx), paths, { allowSession: (session) => { allowed.add(session); declined.delete(session); }, extraUsageChanged: () => declined.clear() }, ctx.sessionManager.getSessionId());
         },
       });
     }

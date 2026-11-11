@@ -52,6 +52,11 @@ export interface ExtraUsageHooks {
   ask?: (session: string, message: string, signal?: AbortSignal) => Promise<boolean>;
   warn?: (message: string) => void;
   allowed?: Set<string>;
+  /**
+   * The sessions whose owner said no (or could not be asked): their next turns stop before anything reaches Claude
+   * Code, so a host retrying on another model (Gentle Shell's fallback) is not billed again. Cleared by allow-session.
+   */
+  declined?: Set<string>;
 }
 
 /**
@@ -202,6 +207,10 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
       const current = settings();
       const configKey = createHash('sha256').update(JSON.stringify([systemPrompt, Boolean(effort), maxTokens, current.claudeCodeContext])).digest('hex');
       const fps = conversation.map(fingerprint);
+      // A session that declined Extra Usage is not sent again (on any model) until it is accepted for the session.
+      const sessionKey = opts.sessionId ?? `conversation:${fps[0] ?? 'empty'}`;
+      const hooks = options.extraUsage ?? {};
+      if (current.extraUsage === 'ask' && hooks.declined?.has(sessionKey) && !hooks.allowed?.has(sessionKey)) throw new Error(declinedMessage());
       const payload = (input: unknown, history?: unknown) => opts.onPayload?.({
         model: model.id, systemPrompt, claudeCodeContext: current.claudeCodeContext, effort, maxTokens, tools, ...(history ? { history } : {}), input,
       }, model);
@@ -251,7 +260,7 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
       proc.seen = fps;
       // The request is set up: Claude Code has the input.
       stream.push({ type: 'start', partial: output });
-      await consume(proc, model, output, stream, opts, current, opts.sessionId ?? `conversation:${fps[0] ?? 'empty'}`);
+      await consume(proc, model, output, stream, opts, current, sessionKey);
       proc.seen.push(fingerprint(output as unknown as Message));
       proc.awaiting = output.stopReason === 'toolUse'
         ? output.content.flatMap((c) => c.type === 'toolCall' ? [{ id: toolId(c.id), name: c.name, args: c.arguments }] : []) : [];
@@ -325,7 +334,7 @@ export function openClaudeService(options: ServiceOptions): ClaudeService {
       const yes = await (hooks.ask?.(session, ASK_QUESTION, signal) ?? Promise.resolve(false)).catch(() => false);
       // A turn aborted while the owner decided ends aborted, and a late yes allows nothing.
       signal?.throwIfAborted();
-      if (!yes) throw new Error(declinedMessage());
+      if (!yes) { hooks.declined?.add(session); throw new Error(declinedMessage()); }
       hooks.allowed?.add(session);
     }
     hooks.warn?.(EXTRA_USAGE_WARNING);

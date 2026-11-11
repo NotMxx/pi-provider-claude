@@ -24,6 +24,8 @@ export interface CommandDeps {
   spawn?: typeof nodeSpawn;
   /** Accepts Extra Usage for one pi session (`/claude-extra-usage allow-session`), in memory only. */
   allowSession?: (session: string) => void;
+  /** The Extra Usage mode was changed: past declines no longer hold. */
+  extraUsageChanged?: () => void;
 }
 
 /** The commands with what they take, as pi lists them. */
@@ -196,6 +198,7 @@ export async function runCommand(name: CommandName, argText: string, owner: Owne
   } else if (name === 'claude-extra-usage' && args.length === 1 && (EXTRA_USAGE_MODES as readonly string[]).includes(args[0]!)) {
     const mode = args[0] as ExtraUsageMode;
     await save(paths, { extraUsage: mode });
+    deps.extraUsageChanged?.();
     out.say(`Extra usage: ${EXTRA_USAGE[mode]}; it applies from the next Claude turn.`);
     exit = 0;
   } else if (name === 'claude-extra-usage' && args.length === 1 && args[0] === 'allow-session' && session && deps.allowSession) {

@@ -690,6 +690,30 @@ test('ask with no one to ask stops the turn like strict', async () => {
   } finally { await env.service.close(); }
 });
 
+test('a declined session is not sent again on another model (a fallback), until allow-session accepts it', async () => {
+  // Gentle Shell retries a quota error on the next model of its chain; a request would be billed before the guard saw it.
+  const declined = new Set<string>();
+  const allowed = new Set<string>();
+  const env = setup([{ steps: [{ overageInUse: true, text: 'billed' }, { overageInUse: true, text: 'billed for s2' }, { text: 'after allow' }] }], { extraUsage: { ask: async () => false, declined, allowed } });
+  try {
+    extraSettings(env, 'ask');
+    const first = await step(env, [user('Hi')]);
+    assert.match(first.msg.errorMessage!, /not accepted for this session/);
+    assert.deepEqual([...declined], ['s1']);
+    const spawned = env.log().length;
+    const fallback = await step(env, [user('Hi')], { model: 'claude-sonnet-5-5' });
+    assert.match(fallback.msg.errorMessage!, /not accepted for this session/);
+    assert.equal(env.log().length, spawned, 'nothing reached Claude Code for the declined session');
+    // Another session is asked on its own.
+    const other = await step(env, [user('Hi')], { sessionId: 's2' });
+    assert.match(other.msg.errorMessage!, /not accepted for this session/);
+    // allow-session clears the decline.
+    allowed.add('s1'); declined.delete('s1');
+    const after = await step(env, [user('Hi')], { model: 'claude-sonnet-5-5' });
+    assert.equal(after.msg.stopReason, 'stop');
+  } finally { await env.service.close(); }
+});
+
 test('allow: the turn goes on, with a warning every time it is billed to Extra Usage', async () => {
   const warned: string[] = [];
   const env = setup([{ steps: [{ overageInUse: true, text: 'billed' }, { text: 'plan' }, { overage: true, text: 'billed again' }] }], { extraUsage: { warn: (t) => warned.push(t) } });

@@ -31,13 +31,13 @@ When no model is set, pi takes the first one, `claude-opus-5-5`.
 
 ## Gentle Shell
 
-Checked with Gentle Shell 4.7.0 on pi 1.5.2, subagents and reviewers included.
+Checked with Gentle Shell 4.7.0 on pi 1.5.2 and with its main branch (2026-11-11, pi 1.4.0): subagents, judges, reviewers, routing, compaction and fallback included.
 
 - Install it as a package, so subagents load it too: `gentle-shell install git:github.com/NotMxx/pi-provider-claude`. An extension passed with `-e` is not passed to subagents.
 - Run `/claude-login` once inside Gentle Shell. It keeps its data in `~/.gentle-shell/agent/pi-provider-claude`, separate from pi's.
 - Subagents with no model route use Opus 5.5. Set a default model, or a subagent `default_model`, to use another.
-- A reached plan limit says "usage limit", which Gentle Shell reads as quota and may answer with its fallback model.
-- A subagent has no UI, so it cannot answer the Extra Usage question. In `ask` mode a subagent turn billed to Extra Usage fails (Gentle Shell treats it as quota and may fall back), unless the parent has a UI or the mode is `allow`.
+- A reached plan limit says "usage limit", which Gentle Shell reads as quota and may answer with its fallback model. The 5-hour and weekly limits cover every model of the subscription, so point fallback chains at another provider; only a per-model limit (such as the weekly Opus one) is worth a fallback within `claude-subscription`.
+- A subagent has no UI, so it cannot answer the Extra Usage question. In `ask` mode a subagent turn billed to Extra Usage fails (Gentle Shell treats it as quota and may fall back), unless the parent has a UI or the mode is `allow`. Once a session declines, its later turns stop before reaching Claude Code, on any model, so a fallback is not billed again; `/claude-extra-usage allow-session` or a new mode clears it.
 
 ## Commands
 
